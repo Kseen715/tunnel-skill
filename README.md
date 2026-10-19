@@ -9,9 +9,12 @@ explicitly ask to give it some, the agent follows `skills/ssh-internet-tunnel/SK
 remote host --- ssh -w (tunN) ---> your machine --- NAT ---> VPN or default interface ---> internet
 ```
 
-The skill is plain text: every command is in `SKILL.md`. The agent shows each block with
-the values filled in, asks before running it, and shows the output. Blocks that need root
-on a host where `sudo` asks for a password are handed to you to paste instead.
+The skill is plain text: every command is in `SKILL.md`. The agent inspects both hosts on
+its own, asks you once to approve the plan, then sets everything up and shows the output.
+Where `sudo` asks for a password, the agent opens a password dialog on your desktop
+(`askpass.sh`: ssh-askpass, zenity or kdialog) and pipes what you type straight into sudo,
+so the password never reaches the agent. Without a desktop session it hands you the block
+to paste instead.
 
 What it does:
 

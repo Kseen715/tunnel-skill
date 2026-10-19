@@ -18,18 +18,25 @@ tunnels (step 3 can enable it); `ssh H` works without a password prompt.
 
 ## Rules
 
-1. **Show, then ask.** Before every step, show the user the exact block you will run with
-   all values filled in, say which host it runs on and what it changes, and wait for a yes.
-   Show the output afterwards. Read-only steps are shown and asked too.
-2. **Never handle passwords.** If step 1 reports `sudo: needs password` for a host, do not
-   run its root blocks yourself. Give the user the part from `sudo sh -s <<'EOF'` to `EOF`
-   (with `-n` removed) and ask them to paste it into a terminal on that host (for the
-   remote host: inside `ssh H`), then paste the output back to you.
-3. **Edit only the values at the top of a block.** Everything else stays as written.
-4. **Stop on failure.** Show the error, check the troubleshooting table, and offer step 9.
-5. **Tear down when done.** When the user's task is finished, ask and then run step 9.
+1. **Do the work yourself; ask once.** Run read-only commands (step 1, the checks, the
+   troubleshooting diagnostics) without asking. After step 2, ask for one approval of the
+   whole plan, then run steps 3 to 8 one after another without further questions, showing
+   each block's output briefly. Ask again only for a choice the user must make (E in
+   step 2) or for a change this file does not describe.
+2. **Never see passwords.** If step 1 reports `sudo: needs password` for a host, run its
+   root blocks through a password dialog on the user's desktop (see "Root with a sudo
+   password"). The password goes from the dialog straight into sudo; it never appears in
+   the chat, your commands or their output. Only if no dialog can be shown, give the user
+   the block to paste into a terminal on that host.
+3. **Edit only the values at the top of a block** (and the first line, for a sudo
+   password). Everything else stays as written.
+4. **Fix failures yourself.** Show the error, run the matching troubleshooting entry, and
+   retry. If that does not help, offer step 9.
+5. **Tear down when done.** When the user's task is finished, ask once and run all of
+   step 9.
 
-Before step 1, tell the user in a few lines what will happen:
+The approval message after step 2 lists the values found, E, which steps change what on
+which host, and in a few lines what will happen:
 
 - The remote host's internet traffic leaves through the user's machine and interface E
   (their VPN if there is one), with the user's public IP.
@@ -51,7 +58,34 @@ Before step 1, tell the user in a few lines what will happen:
 | `CLIENT` | the user's address as the remote host sees it | step 1 `client:` |
 | `E` | egress interface on the user's machine | step 2 |
 | `FORCE` | `yes` only when E is a VPN that is not the current internet route | step 2 |
-| `DNS` | DNS server for the remote host, default `8.8.8.8` | ask only if it fails |
+| `DNS` | DNS server for the remote host, default `8.8.8.8` | troubleshooting, if it fails |
+
+## Root with a sudo password
+
+`askpass.sh` in this skill's directory opens a password dialog on the user's desktop
+(ssh-askpass, zenity or kdialog) and prints the password. With `A` its full path, change
+only the first line of a root block:
+
+- User's machine: `sudo -n sh -s <<'EOF'` becomes
+  ```
+  SUDO_ASKPASS=A sudo -A sh -s <<'EOF'
+  ```
+- Remote host: `ssh H 'sudo -n sh -s' <<'EOF'` becomes (the remote side reads the password
+  line, validates it with `sudo -v`, then runs the rest of the block as root)
+  ```
+  P=$(A "sudo password for LOGIN on H") || exit
+  { printf '%s\n' "$P"; cat; } <<'EOF' | ssh H 'IFS= read -r P; printf "%s\n" "$P" | sudo -S -p "" -v && sudo -n sh -s; exit $?'
+  ```
+  Keep this line as is: without a tty, sudo caches the password per parent process, so
+  both sudo calls must be children of the same shell (no `exec`).
+
+Turn a one-line root command (step 9) into such a block with the command as its body.
+Never print `$P` or pass it anywhere else. If the user cancels the dialog, stop and ask.
+If `askpass.sh` prints `askpass: no ...` (no dialog can be shown, exit 2), fall back to
+handing the block, from `sudo sh -s <<'EOF'` to `EOF`, to the user to paste into a terminal
+on that host (for the remote host: inside `ssh H`), and ask for the output.
+If the remote host prints `a password is required` after a correct password, its sudo does
+not cache credentials: fall back to pasting for that host.
 
 ## Step 1. Discover (read-only, both hosts)
 
@@ -84,8 +118,9 @@ sudo -n sshd -T 2>/dev/null | grep -i '^permittunnel' || echo "permittunnel: unk
 EOF
 ```
 
-Stop if the remote host already has internet or the user's machine has none. Show the
-user a short summary of the values found and the N you picked.
+Stop if the remote host already has internet or the user's machine has none. If
+`permittunnel` is unknown, run `sshd -T | grep -i '^permittunnel'` as root on the remote
+host (see "Root with a sudo password").
 
 ## Step 2. Choose the egress interface E
 
@@ -94,20 +129,21 @@ VPN policy routing, so trust it over `ip route show default`. The `vpn-like` lis
 point-to-point, tun and WireGuard links (OpenVPN, WireGuard, sing-box or clash TUN, ppp,
 tailscale). Their names vary, so judge by this list, not by name.
 
-- X is in the vpn-like list: propose `E=X`, `FORCE=no`.
-- X is not, but the list is not empty: ask the user to choose between `E=X`, `FORCE=no`
-  (current route) and `E=<vpn>`, `FORCE=yes` (policy route into the VPN; works only if that
-  VPN carries internet traffic, which split-tunnel corporate VPNs often do not).
-- The list is empty: propose `E=X`, `FORCE=no`.
+- X is in the vpn-like list: `E=X`, `FORCE=no`.
+- X is not, but the list is not empty: in the approval message, ask the user to choose
+  between `E=X`, `FORCE=no` (current route) and `E=<vpn>`, `FORCE=yes` (policy route into
+  the VPN; works only if that VPN carries internet traffic, which split-tunnel corporate
+  VPNs often do not).
+- The list is empty: `E=X`, `FORCE=no`.
 
-Always confirm E with the user; they may name another interface. Tunnel traffic may only
+Name E in the approval message (rule 1); the user may pick another interface. Tunnel traffic may only
 leave through E: if E goes down, the remote host loses internet instead of leaking out of
 another interface.
 
 ## Step 3. Allow tunnels in the remote sshd (only if PermitTunnel is `no` or `ethernet`)
 
-Tell the user this changes the sshd configuration until step 9 reverts it, and reloads
-sshd (open sessions stay).
+This changes the sshd configuration until step 9 reverts it, and reloads sshd (open
+sessions stay); say so in the approval message.
 
 ```sh
 ssh H 'sudo -n sh -s' <<'EOF'
@@ -121,15 +157,15 @@ sshd -t
 if [ -d /run/systemd/system ]; then
   for u in ssh sshd; do systemctl try-reload-or-restart "$u" 2>/dev/null || true; done
 else
-  kill -HUP "$(cat /run/sshd.pid)"
+  kill -HUP "$(cat /run/sshd.pid 2>/dev/null || pgrep -o -x sshd)"
 fi
 sshd -T | grep -i '^permittunnel'
 EOF
 ```
 
 It must print `permittunnel point-to-point` or `yes`. If not, an earlier line wins (sshd uses
-the first value it reads); show `sudo grep -rni permittunnel /etc/ssh/` to the user and ask.
-If the reload fails (no systemd and no `/run/sshd.pid`), ask the user how sshd is reloaded on that host.
+the first value it reads): run `grep -rni permittunnel /etc/ssh/` as root, show the
+user the line that wins, and ask before changing it.
 
 ## Step 4. Prepare the user's machine (root)
 
@@ -280,7 +316,7 @@ the remote proxy settings (`env | grep -i proxy`, `/etc/apt/apt.conf.d/`, `/etc/
 
 ## Step 9. Tear down
 
-Ask the user first. Run in this order, replacing 9 with N:
+Ask the user once, then run all of it in this order, replacing 9 with N:
 
 1. Stop the tunnel (user's machine):
    ```sh
@@ -294,13 +330,13 @@ Ask the user first. Run in this order, replacing 9 with N:
    Both paths must be gone and resolv.conf back to the original. If not, run
    `ssh H 'sudo -n sh /run/ssh-inet-tunnel-9/restore.sh'`. If step 7 never ran, run
    `ssh H 'sudo -n ip link del tun9'`.
-3. User's machine: show the undo script, then run it:
+3. User's machine: print the undo script, then run it:
    ```sh
    sudo -n cat /run/ssh-inet-tunnel-9/restore.sh
    sudo -n sh /run/ssh-inet-tunnel-9/restore.sh
    ```
    Errors about missing rules are harmless if step 4 stopped halfway.
-4. If step 3 changed sshd, ask whether to revert it:
+4. If step 3 changed sshd, revert it:
    ```sh
    ssh H 'sudo -n sh -s' <<'EOF'
    rm -f /etc/ssh/sshd_config.d/00-ssh-internet-tunnel.conf
@@ -309,7 +345,7 @@ Ask the user first. Run in this order, replacing 9 with N:
    if [ -d /run/systemd/system ]; then
      for u in ssh sshd; do systemctl try-reload-or-restart "$u" 2>/dev/null || true; done
    else
-     kill -HUP "$(cat /run/sshd.pid)"
+     kill -HUP "$(cat /run/sshd.pid 2>/dev/null || pgrep -o -x sshd)"
    fi
    EOF
    ```
@@ -321,7 +357,7 @@ Ask the user first. Run in this order, replacing 9 with N:
 | `administratively prohibited: open failed` | PermitTunnel is off on the remote host: step 3. |
 | `Tunnel device open failed` / `Failed to open the tunnel device` | `tunN` is missing or owned by another user on that side: check U (step 4) and LOGIN (step 5). |
 | step 6 route check shows a dev other than E | Traffic would leave elsewhere and the NAT rule would not match. Pick that dev as E, or use `FORCE=yes`. |
-| carriers are 1, remote curl times out | Another firewall drops forwarding on the user's machine (firewalld, plain nftables): show `sudo nft list ruleset \| grep -iE 'drop\|reject'` to the user. |
-| IPs work, names do not | DNS is blocked on the egress path: ask the user for a public DNS server reachable through E and rerun the DNS part of step 7. A private DNS server is rejected by the step 4 firewall. |
+| carriers are 1, remote curl times out | Another firewall drops forwarding on the user's machine (firewalld, plain nftables): run `nft list ruleset \| grep -iE 'drop\|reject'` as root, show the user the rule that drops `tunN` traffic, and ask before changing it. |
+| IPs work, names do not | DNS is blocked on the egress path: on the remote host, as root, write `nameserver 1.1.1.1` to `/etc/resolv.conf`, then `9.9.9.9`, and rerun step 8 after each. If neither works, ask the user for a public DNS server reachable through E. A private DNS server is rejected by the step 4 firewall. |
 | small requests work, TLS or large downloads hang | MTU: run `ip link set tunN mtu 1280` as root on both hosts. |
 | remote internet stops while working | Tunnel dropped and the watchdog restored the network: rerun steps 4 to 7. |
