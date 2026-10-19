@@ -21,6 +21,7 @@ DOCKERFILE = """
 FROM debian:13
 RUN apt-get update && apt-get install -y --no-install-recommends \
       openssh-client openssh-server iproute2 iptables curl ca-certificates sudo procps \
+      python3 passt \
     && rm -rf /var/lib/apt/lists/* && mkdir -p /run/sshd
 RUN for u in alice bob; do useradd -m -s /bin/bash $u \
       && echo "$u ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/$u; done
@@ -67,7 +68,7 @@ def setup():
     sh(f"docker network create {NETS[0]}")
     sh(f"docker network create --internal {NETS[1]}")
     for name, net in (("remote", NETS[1]), ("local", NETS[0])):
-        sh(f"docker run -d --privileged --name {name} --hostname {name} --network {net} {IMAGE} sleep infinity")
+        sh(f"docker run -d --init --privileged --name {name} --hostname {name} --network {net} {IMAGE} sleep infinity")
     sh(f"docker network connect {NETS[1]} local")
     # remote: sshd with alice's key for bob
     sh("docker exec -u alice local sh -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
@@ -76,6 +77,7 @@ def setup():
        " && chown -R bob ~bob/.ssh && /usr/sbin/sshd'", input=key)
     sh("docker exec -i -u alice local sh -c 'cat > ~/.ssh/config'",
        input="Host remote\n  User bob\n  StrictHostKeyChecking accept-new\n")
+    sh("docker cp skills/ssh-internet-tunnel/tunbridge.py local:/home/alice/tunbridge.py", cwd=ROOT)
     # an air-gapped LAN usually still has a default gateway that goes nowhere
     gw = sh("docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' " + NETS[1]).strip()
     remote(f"ip route replace default via {gw}")
@@ -87,6 +89,8 @@ def cleanup():
 
 
 def main():
+    # Claude Code replaces $0, $1, ... in SKILL.md with the skill's arguments.
+    assert not re.search(r"\$\d", SKILL), "SKILL.md must not use positional parameters"
     cleanup()
     setup()
     s = steps()
@@ -95,34 +99,39 @@ def main():
 
     out = run_local(s[1][0]) + run_local(s[1][1])
     assert "internet: no" in out and "internet: http 200" in out
-    assert "permittunnel no" in out
+    assert "pasta: ok" in out and "python: /usr/bin/python3" in out
     egress = re.search(r"dev (\S+)", out).group(1)
     client = re.search(r"client: (\S+)", out).group(1)
+    iptables_before = sh("docker exec local sh -c 'iptables -S; iptables -t nat -S'")
 
-    out = run_local(s[3][0])
-    assert "permittunnel point-to-point" in out
-    run_local(s[4][0], [(r"^E=\S+", f"E={egress}")])
-    run_local(s[5][0])
+    run_local(s[3][0])
+    out = run_local(s[4][0], [(r"^E=\S+", f"E={egress}"),
+                              (r"^BRIDGE=\S+", "BRIDGE=/home/alice/tunbridge.py")])
+    assert "tunnel up" in out
+    run_local(s[5][0], [(r"^CLIENT=\S+", f"CLIENT={client}")])
     out = run_local(s[6][0])
-    assert out.split()[:2] == ["1", "1"] and f"dev {egress}" in out
-    run_local(s[7][0], [(r"^CLIENT=\S+", f"CLIENT={client}")])
-    out = run_local(s[8][0])
     assert "HTTP/2 200" in out or "HTTP/1.1 200" in out
-    # remote must not reach the local machine itself or private ranges through the tunnel
-    assert remote("curl -s -m 3 http://10.254.9.1:22 >/dev/null; echo $?").strip() != "0"
+
+    # The tunnel must not reach the user's machine: neither the namespace end nor the
+    # host's own addresses. --interface forces the request into the tunnel.
+    sh("docker exec -d -u alice local python3 -m http.server 8000")
+    local_ip = sh("docker exec local hostname -I").split()[0]
+    for target in ("10.254.9.1", local_ip):
+        rc = remote(f"curl -s -m 3 --interface tun9 http://{target}:8000 >/dev/null; echo $?")
+        assert rc.strip() != "0", f"remote reached {target} through the tunnel"
+    # Nothing changed on the user's machine itself.
+    assert sh("docker exec local sh -c 'iptables -S; iptables -t nat -S'") == iptables_before
+    assert "tun9" not in sh("docker exec local ls /sys/class/net")
 
     # Drop the tunnel: the watchdog must restore the remote host on its own.
-    run_local(s[9][0])
+    run_local(s[7][0])
     time.sleep(5)
-    out = run_local(s[9][1])
+    out = run_local(s[7][1])
     assert out.count("No such file") == 2
     assert remote("cat /etc/resolv.conf") == resolv_before
     assert remote("ip -4 route show default") == default_before
     assert "10.0.0.0/8" not in remote("ip route")
-    run_local(s[9][2])
-    run_local(s[9][3])
-    assert "tun9" not in sh("docker exec local ls /sys/class/net")
-    assert "10.254" not in sh("docker exec local iptables-save")
+    assert "pasta" not in sh("docker exec local ps -eo stat=,comm= | grep -v ^Z")
     assert "permittunnel no" in remote("sshd -T | grep -i ^permittunnel")
     print("\nOK: tunnel up, remote got internet, everything restored")
 

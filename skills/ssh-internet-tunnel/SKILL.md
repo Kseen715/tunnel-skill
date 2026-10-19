@@ -1,6 +1,6 @@
 ---
 name: ssh-internet-tunnel
-description: Give a remote Linux host that has no internet access temporary internet through the user's own machine, using an SSH layer-3 tunnel (ssh -w) and NAT on the user's machine, preferably out of the user's VPN. Use only when you work on a remote host over SSH, that host cannot reach the internet, the user's machine can, and the user explicitly asks to give the remote host internet access (for example to install packages, pull images or clone repositories). Do not use for ordinary SSH work or start it on your own after a failed download; offer it and wait for the user's request.
+description: Give a remote Linux host that has no internet access temporary internet through the user's own machine, using a layer-3 tunnel carried over a plain SSH connection and rootless NAT (pasta) on the user's machine, preferably out of the user's VPN. Use only when you work on a remote host over SSH, that host cannot reach the internet, the user's machine can, and the user explicitly asks to give the remote host internet access (for example to install packages, pull images or clone repositories). Do not use for ordinary SSH work or start it on your own after a failed download; offer it and wait for the user's request.
 ---
 
 # SSH internet tunnel
@@ -8,42 +8,50 @@ description: Give a remote Linux host that has no internet access temporary inte
 Routes a remote host's IPv4 internet traffic through the user's machine:
 
 ```
-remote host --- ssh -w (tunN) ---> user's machine --- NAT ---> egress interface (VPN or default) ---> internet
-10.254.N.2                         10.254.N.1
+remote host                                  user's machine, private network namespace (no root)
+tunN 10.254.N.2 <-> tunbridge.py == ssh H == tunbridge.py <-> tunN 10.254.N.1 -- NAT -- pasta -- interface E -- internet
 ```
 
-Requirements: both hosts are Linux with iproute2; the user's machine has `iptables`
-(the nft backend is fine); root (sudo) on both hosts; the remote OpenSSH server allows
-tunnels (step 3 can enable it); `ssh H` works without a password prompt.
+`tunbridge.py` (in this skill's directory) moves IP packets between a tun device and
+stdin/stdout, so the tunnel rides on an ordinary `ssh H` session: no `ssh -w`, no sshd
+change. On the user's machine everything runs in a network namespace made by `pasta`
+as the normal user; pasta sends the traffic out through interface E with ordinary
+sockets. Root is needed only on the remote host.
+
+Requirements: both hosts are Linux; the user's machine has `pasta` (package `passt`) and
+`python3`; the remote host has iproute2, `python3` and root (sudo); `ssh H` works without
+a password prompt.
 
 ## Rules
 
 1. **Do the work yourself; ask once.** Run read-only commands (step 1, the checks, the
    troubleshooting diagnostics) without asking. After step 2, ask for one approval of the
-   whole plan, then run steps 3 to 8 one after another without further questions, showing
+   whole plan, then run steps 3 to 6 one after another without further questions, showing
    each block's output briefly. Ask again only for a choice the user must make (E in
    step 2) or for a change this file does not describe.
-2. **Never see passwords.** If step 1 reports `sudo: needs password` for a host, run its
-   root blocks through a password dialog on the user's desktop (see "Root with a sudo
-   password"). The password goes from the dialog straight into sudo; it never appears in
-   the chat, your commands or their output. Only if no dialog can be shown, give the user
-   the block to paste into a terminal on that host.
+2. **Never see passwords.** If step 1 reports `sudo: needs password` on the remote host,
+   run its root blocks through a password dialog on the user's desktop (see "Root with a
+   sudo password"). The password goes from the dialog straight into sudo; it never appears
+   in the chat, your commands or their output. Only if no dialog can be shown, give the
+   user the block to paste into a terminal on that host.
 3. **Edit only the values at the top of a block** (and the first line, for a sudo
    password). Everything else stays as written.
 4. **Fix failures yourself.** Show the error, run the matching troubleshooting entry, and
-   retry. If that does not help, offer step 9.
+   retry. If that does not help, offer step 7.
 5. **Tear down when done.** When the user's task is finished, ask once and run all of
-   step 9.
+   step 7.
 
 The approval message after step 2 lists the values found, E, which steps change what on
 which host, and in a few lines what will happen:
 
 - The remote host's internet traffic leaves through the user's machine and interface E
   (their VPN if there is one), with the user's public IP.
+- Nothing on the user's machine needs root or changes: the tunnel lives in a private
+  network namespace that disappears when the tunnel stops.
 - While active, the remote host uses public DNS (`8.8.8.8` by default); internal names may
   not resolve. Its private ranges (10/8, 172.16/12, 192.168/16) and the SSH connection to
   the user keep their current routes.
-- The user's machine drops tunnel traffic to itself and to private ranges: the remote host
+- Tunnel traffic to the user's machine and to private ranges is rejected: the remote host
   gets the internet only, not the user's LAN or VPN-internal networks.
 - IPv4 only. A watchdog restores the remote network if the tunnel drops.
 
@@ -52,12 +60,12 @@ which host, and in a few lines what will happen:
 | Value | Meaning | Source |
 |---|---|---|
 | `H` | ssh destination exactly as the user uses it (alias or `user@host`) | conversation |
-| `N` | tunnel number: device `tunN` on both hosts, `10.254.N.1` local, `10.254.N.2` remote | step 1: smallest N from 9 up with no `tunN` and no `10.254.N.` address on either host |
-| `U` | local user name | step 1 `user:` |
+| `N` | tunnel number: device `tunN` on both ends, `10.254.N.1` local, `10.254.N.2` remote | step 1: smallest N from 9 up with no `tunN` and no `10.254.N.` address on the remote host |
 | `LOGIN` | remote login user | step 1 `login:` |
 | `CLIENT` | the user's address as the remote host sees it | step 1 `client:` |
+| `PY` | python on the remote host | step 1 `python:` |
 | `E` | egress interface on the user's machine | step 2 |
-| `FORCE` | `yes` only when E is a VPN that is not the current internet route | step 2 |
+| `BRIDGE` | full path of `tunbridge.py` in this skill's directory | this skill |
 | `DNS` | DNS server for the remote host, default `8.8.8.8` | troubleshooting, if it fails |
 
 ## Root with a sudo password
@@ -66,10 +74,6 @@ which host, and in a few lines what will happen:
 (ssh-askpass, zenity or kdialog) and prints the password. With `A` its full path, change
 only the first line of a root block:
 
-- User's machine: `sudo -n sh -s <<'EOF'` becomes
-  ```
-  SUDO_ASKPASS=A sudo -A sh -s <<'EOF'
-  ```
 - Remote host: `ssh H 'sudo -n sh -s' <<'EOF'` becomes (the remote side reads the password
   line, validates it with `sudo -v`, then runs the rest of the block as root)
   ```
@@ -78,8 +82,9 @@ only the first line of a root block:
   ```
   Keep this line as is: without a tty, sudo caches the password per parent process, so
   both sudo calls must be children of the same shell (no `exec`).
+- User's machine (only to install `passt`): `sudo -n CMD` becomes `SUDO_ASKPASS=A sudo -A CMD`.
 
-Turn a one-line root command (step 9) into such a block with the command as its body.
+Turn a one-line root command (step 7) into such a block with the command as its body.
 Never print `$P` or pass it anywhere else. If the user cancels the dialog, stop and ask.
 If `askpass.sh` prints `askpass: no ...` (no dialog can be shown, exit 2), fall back to
 handing the block, from `sudo sh -s <<'EOF'` to `EOF`, to the user to paste into a terminal
@@ -92,14 +97,12 @@ not cache credentials: fall back to pasting for that host.
 User's machine:
 
 ```sh
-echo "user: $(id -un)"
 ip -4 route get 1.1.1.1
 echo "vpn-like:"; ip -o -d link show | grep -E 'POINTOPOINT|wireguard|tun type' | cut -d: -f2
 curl -sS -m 5 -o /dev/null -w 'internet: http %{http_code}\n' https://example.com
-echo "ip_forward: $(cat /proc/sys/net/ipv4/ip_forward)"
-echo "links: $(ls /sys/class/net | tr '\n' ' ')"
-echo "10.254 in use: $(ip -4 addr | grep -o '10\.254\.[0-9]*\.' | sort -u | tr '\n' ' ')"
-sudo -n true 2>/dev/null && echo "sudo: ok" || echo "sudo: needs password"
+command -v python3 >/dev/null && echo "python3: ok" || echo "python3: missing"
+if pasta --config-net -q -- true 2>/dev/null; then echo "pasta: ok"
+elif command -v pasta >/dev/null; then echo "pasta: blocked"; else echo "pasta: missing"; fi
 ```
 
 Remote host:
@@ -113,14 +116,15 @@ echo "links: $(ls /sys/class/net | tr '\n' ' ')"
 echo "10.254 in use: $(ip -4 addr | grep -o '10\.254\.[0-9]*\.' | sort -u | tr '\n' ' ')"
 (curl -sS -m 5 -o /dev/null https://example.com || wget -q -T 5 -O /dev/null https://example.com) 2>/dev/null \
   && echo "internet: yes" || echo "internet: no"
+echo "python: $(command -v python3 || command -v /usr/libexec/platform-python || echo none)"
 sudo -n true 2>/dev/null && echo "sudo: ok" || echo "sudo: needs password"
-sudo -n sshd -T 2>/dev/null | grep -i '^permittunnel' || echo "permittunnel: unknown (needs root)"
 EOF
 ```
 
 Stop if the remote host already has internet or the user's machine has none. If
-`permittunnel` is unknown, run `sshd -T | grep -i '^permittunnel'` as root on the remote
-host (see "Root with a sudo password").
+`python: none`, stop and tell the user the remote host has no Python. If `pasta: missing`,
+include installing package `passt` (as root, through the password dialog) in the
+approval message. For `pasta: blocked`, see troubleshooting.
 
 ## Step 2. Choose the egress interface E
 
@@ -129,91 +133,19 @@ VPN policy routing, so trust it over `ip route show default`. The `vpn-like` lis
 point-to-point, tun and WireGuard links (OpenVPN, WireGuard, sing-box or clash TUN, ppp,
 tailscale). Their names vary, so judge by this list, not by name.
 
-- X is in the vpn-like list: `E=X`, `FORCE=no`.
+- X is in the vpn-like list, or the list is empty: `E=X`.
 - X is not, but the list is not empty: in the approval message, ask the user to choose
-  between `E=X`, `FORCE=no` (current route) and `E=<vpn>`, `FORCE=yes` (policy route into
-  the VPN; works only if that VPN carries internet traffic, which split-tunnel corporate
-  VPNs often do not).
-- The list is empty: `E=X`, `FORCE=no`.
+  between `E=X` (current route) and `E=<vpn>` (works only if that VPN carries internet
+  traffic, which split-tunnel corporate VPNs often do not).
 
-Name E in the approval message (rule 1); the user may pick another interface. Tunnel traffic may only
-leave through E: if E goes down, the remote host loses internet instead of leaking out of
-another interface.
+Name E in the approval message (rule 1); the user may pick another interface. pasta binds
+its sockets to E, so tunnel traffic leaves only through E, even when E is not the current
+route; if E goes down, the remote host loses internet instead of leaking out of another
+interface.
 
-## Step 3. Allow tunnels in the remote sshd (only if PermitTunnel is `no` or `ethernet`)
+## Step 3. Prepare the remote host (root)
 
-This changes the sshd configuration until step 9 reverts it, and reloads sshd (open
-sessions stay); say so in the approval message.
-
-```sh
-ssh H 'sudo -n sh -s' <<'EOF'
-set -eu
-if grep -Eqs '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
-  echo 'PermitTunnel point-to-point' > /etc/ssh/sshd_config.d/00-ssh-internet-tunnel.conf
-else
-  printf '\n# ssh-internet-tunnel\nPermitTunnel point-to-point\n' >> /etc/ssh/sshd_config
-fi
-sshd -t
-if [ -d /run/systemd/system ]; then
-  for u in ssh sshd; do systemctl try-reload-or-restart "$u" 2>/dev/null || true; done
-else
-  kill -HUP "$(cat /run/sshd.pid 2>/dev/null || pgrep -o -x sshd)"
-fi
-sshd -T | grep -i '^permittunnel'
-EOF
-```
-
-It must print `permittunnel point-to-point` or `yes`. If not, an earlier line wins (sshd uses
-the first value it reads): run `grep -rni permittunnel /etc/ssh/` as root, show the
-user the line that wins, and ask before changing it.
-
-## Step 4. Prepare the user's machine (root)
-
-Creates `tunN` owned by U, enables forwarding, adds firewall and NAT rules, and writes
-the undo script `/run/ssh-inet-tunnel-N/restore.sh`.
-
-```sh
-sudo -n sh -s <<'EOF'
-set -eu
-N=9           # tunnel number
-E=wg0         # egress interface
-FORCE=no      # yes: policy-route tunnel traffic into E (VPN that is not the current route)
-U=alice       # local user that runs ssh in step 6
-T=tun$N L=10.254.$N.1 R=10.254.$N.2 D=/run/ssh-inet-tunnel-$N TABLE=$((25400 + N))
-PRIVATE=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10
-mkdir -m 700 "$D"
-cat > "$D/restore.sh" <<UNDO
-ip link del $T
-iptables -D INPUT -i $T -j DROP
-iptables -D FORWARD -i $T -d $PRIVATE -j REJECT
-iptables -D FORWARD -i $T -o $E -j ACCEPT
-iptables -D FORWARD -i $E -o $T -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-iptables -t nat -D POSTROUTING -s $R -o $E -j MASQUERADE
-ip rule del from $R lookup $TABLE 2>/dev/null
-ip route flush table $TABLE 2>/dev/null
-sysctl -qw net.ipv4.ip_forward=$(cat /proc/sys/net/ipv4/ip_forward)
-rm -rf $D
-UNDO
-ip tuntap add dev $T mode tun user $U
-ip addr add $L peer $R dev $T
-ip link set $T up
-sysctl -qw net.ipv4.ip_forward=1
-iptables -I INPUT -i $T -j DROP
-iptables -I FORWARD -i $E -o $T -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-iptables -I FORWARD -i $T -o $E -j ACCEPT
-iptables -I FORWARD -i $T -d $PRIVATE -j REJECT
-iptables -t nat -A POSTROUTING -s $R -o $E -j MASQUERADE
-if [ "$FORCE" = yes ]; then
-  ip route add default dev $E table $TABLE
-  ip rule add from $R lookup $TABLE priority 100
-fi
-echo "local side ready: $T $L <-> $R, egress $E"
-EOF
-```
-
-## Step 5. Prepare the remote host (root)
-
-Creates `tunN` owned by LOGIN, so the tunnel needs no root SSH login.
+Creates `tunN` owned by LOGIN, so the remote bridge runs without root.
 `ignore_routes_with_linkdown` makes the kernel stop using the tunnel routes the moment the
 tunnel drops, before the watchdog cleans up.
 
@@ -231,19 +163,61 @@ echo "remote side ready: $T"
 EOF
 ```
 
-## Step 6. Start the tunnel (user's machine, no root)
+## Step 4. Start the tunnel (user's machine, no root)
+
+Checks that pasta reaches the internet through E, then starts in the background, detached
+from your shell: pasta with a private namespace holding `tunN`, NAT and the firewall, and
+`ssh H` running the remote bridge. State and log go to
+`$XDG_RUNTIME_DIR/ssh-inet-tunnel-N/` (or `/tmp/...`).
 
 ```sh
-ssh -f -N -S none -w 9:9 -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 H
-cat /sys/class/net/tun9/carrier
-ssh H cat /sys/class/net/tun9/carrier
-ip -4 route get 1.1.1.1 from 10.254.9.2 iif tun9
+sh -s <<'EOF'
+set -eu
+N=9                    # tunnel number
+E=wg0                  # egress interface
+PY=python3             # python on the remote host
+BRIDGE=/path/to/tunbridge.py
+D=${XDG_RUNTIME_DIR:-/tmp}/ssh-inet-tunnel-$N
+PASTA="pasta --config-net -q --no-map-gw --outbound-if4 $E"
+BLOCK=0.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10
+SELF=$(ip -4 -o addr show | tr -s ' ' | cut -d' ' -f4 | cut -d/ -f1 | paste -sd, -)
+IP=$(getent ahostsv4 example.com | head -n 1 | cut -d' ' -f1)
+$PASTA -- curl -sS -m 10 -o /dev/null --resolve "example.com:443:$IP" https://example.com \
+  || { echo "pasta cannot reach the internet through $E" >&2; exit 1; }
+mkdir -m 700 "$D"
+mkfifo "$D/in"
+cat > "$D/ns.sh" <<NS
+set -eu
+ip tuntap add dev tun$N mode tun
+ip addr add 10.254.$N.1 peer 10.254.$N.2 dev tun$N
+ip link set tun$N up
+sysctl -qw net.ipv4.ip_forward=1
+iptables -A INPUT -i tun$N -j DROP
+iptables -A FORWARD -i tun$N -d $BLOCK,$SELF -j REJECT
+iptables -t nat -A POSTROUTING -s 10.254.$N.2 -j MASQUERADE
+echo "local side ready: tun$N 10.254.$N.1 <-> 10.254.$N.2, egress $E" >&2
+exec python3 $BRIDGE tun$N
+NS
+D="$D" PASTA="$PASTA" REMOTE="$PY -c \"import base64; exec(base64.b64decode('$(base64 -w0 "$BRIDGE")'))\" tun$N" \
+  setsid sh -c 'echo $$ > "$D/pid"
+    $PASTA -- sh "$D/ns.sh" < "$D/in" \
+      | ssh -T -o ServerAliveInterval=15 -o ServerAliveCountMax=3 H "$REMOTE" > "$D/in"' \
+  < /dev/null > /dev/null 2> "$D/log" &
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 1
+  kill -0 "$(cat "$D/pid" 2>/dev/null)" 2>/dev/null || break
+  if grep -q 'local side ready' "$D/log" && [ "$(ssh -n H cat /sys/class/net/tun$N/carrier)" = 1 ]; then
+    cat "$D/log"; echo "tunnel up"; exit 0
+  fi
+done
+cat "$D/log"; echo "tunnel failed" >&2; exit 1
+EOF
 ```
 
-Replace 9 with N. Both carriers must print `1`, and the last line must show `dev E`.
-`-f` puts ssh in the background once the tunnel is up; it keeps running after you return.
+It must print `tunnel up`. pasta may also print `Couldn't get any nameserver address`;
+that is harmless.
 
-## Step 7. Route the remote host through the tunnel (root)
+## Step 5. Route the remote host through the tunnel (root)
 
 Pins the route back to CLIENT, keeps private ranges on the current gateway, sends the rest
 into the tunnel, switches DNS, writes `/run/ssh-inet-tunnel-N/restore.sh` and starts the
@@ -256,7 +230,7 @@ N=9               # tunnel number
 CLIENT=192.0.2.10 # the user's address as seen by the remote host
 DNS=8.8.8.8
 T=tun$N D=/run/ssh-inet-tunnel-$N
-[ "$(cat /sys/class/net/$T/carrier 2>/dev/null)" = 1 ] || { echo "$T is not connected, run step 6" >&2; exit 1; }
+[ "$(cat /sys/class/net/$T/carrier 2>/dev/null)" = 1 ] || { echo "$T is not connected, run step 4" >&2; exit 1; }
 mkdir -m 700 "$D"
 echo "ip link del $T 2>/dev/null" > "$D/restore.sh"
 
@@ -268,12 +242,14 @@ if [ -z "$(ip -4 route show exact "$CLIENT/32")" ]; then
 fi
 
 # Keep private ranges on the current default gateway.
-set -- $(ip -4 route show default | head -n 1)
-if [ "${2:-}" = via ]; then
+read -r _ VIA GW _ DEV _ <<ROUTE
+$(ip -4 route show default | head -n 1)
+ROUTE
+if [ "$VIA" = via ]; then
   for NET in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
     [ -z "$(ip -4 route show exact $NET)" ] || continue
-    ip route add $NET via "$3" dev "$5"
-    echo "ip route del $NET via $3 dev $5 2>/dev/null" >> "$D/restore.sh"
+    ip route add $NET via "$GW" dev "$DEV"
+    echo "ip route del $NET via $GW dev $DEV 2>/dev/null" >> "$D/restore.sh"
   done
 fi
 
@@ -305,7 +281,7 @@ echo "remote host routed through $T"
 EOF
 ```
 
-## Step 8. Verify, then do the user's task
+## Step 6. Verify, then do the user's task
 
 ```sh
 ssh H 'getent hosts example.com; curl -sSI -m 10 https://example.com | head -n 1'
@@ -314,13 +290,15 @@ ssh H 'getent hosts example.com; curl -sSI -m 10 https://example.com | head -n 1
 Then run what the user asked for. If curl works but a package manager does not, check
 the remote proxy settings (`env | grep -i proxy`, `/etc/apt/apt.conf.d/`, `/etc/dnf/dnf.conf`).
 
-## Step 9. Tear down
+## Step 7. Tear down
 
 Ask the user once, then run all of it in this order, replacing 9 with N:
 
-1. Stop the tunnel (user's machine):
+1. Stop the tunnel (user's machine). This ends ssh, both bridges and the namespace with
+   its NAT and firewall:
    ```sh
-   pkill -f 'ssh -f -N -S none -w 9:9 '
+   D=${XDG_RUNTIME_DIR:-/tmp}/ssh-inet-tunnel-9
+   pkill -g "$(cat "$D/pid")"; rm -rf "$D"
    ```
 2. Remote host: the watchdog restores routes and DNS and deletes `tun9` within a few
    seconds. Check:
@@ -328,36 +306,15 @@ Ask the user once, then run all of it in this order, replacing 9 with N:
    ssh H 'ls -d /run/ssh-inet-tunnel-9 /sys/class/net/tun9 2>&1; cat /etc/resolv.conf'
    ```
    Both paths must be gone and resolv.conf back to the original. If not, run
-   `ssh H 'sudo -n sh /run/ssh-inet-tunnel-9/restore.sh'`. If step 7 never ran, run
+   `ssh H 'sudo -n sh /run/ssh-inet-tunnel-9/restore.sh'`. If step 5 never ran, run
    `ssh H 'sudo -n ip link del tun9'`.
-3. User's machine: print the undo script, then run it:
-   ```sh
-   sudo -n cat /run/ssh-inet-tunnel-9/restore.sh
-   sudo -n sh /run/ssh-inet-tunnel-9/restore.sh
-   ```
-   Errors about missing rules are harmless if step 4 stopped halfway.
-4. If step 3 changed sshd, revert it:
-   ```sh
-   ssh H 'sudo -n sh -s' <<'EOF'
-   rm -f /etc/ssh/sshd_config.d/00-ssh-internet-tunnel.conf
-   sed -i '/^# ssh-internet-tunnel$/,+1d' /etc/ssh/sshd_config
-   sshd -t
-   if [ -d /run/systemd/system ]; then
-     for u in ssh sshd; do systemctl try-reload-or-restart "$u" 2>/dev/null || true; done
-   else
-     kill -HUP "$(cat /run/sshd.pid 2>/dev/null || pgrep -o -x sshd)"
-   fi
-   EOF
-   ```
 
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
-| `administratively prohibited: open failed` | PermitTunnel is off on the remote host: step 3. |
-| `Tunnel device open failed` / `Failed to open the tunnel device` | `tunN` is missing or owned by another user on that side: check U (step 4) and LOGIN (step 5). |
-| step 6 route check shows a dev other than E | Traffic would leave elsewhere and the NAT rule would not match. Pick that dev as E, or use `FORCE=yes`. |
-| carriers are 1, remote curl times out | Another firewall drops forwarding on the user's machine (firewalld, plain nftables): run `nft list ruleset \| grep -iE 'drop\|reject'` as root, show the user the rule that drops `tunN` traffic, and ask before changing it. |
-| IPs work, names do not | DNS is blocked on the egress path: on the remote host, as root, write `nameserver 1.1.1.1` to `/etc/resolv.conf`, then `9.9.9.9`, and rerun step 8 after each. If neither works, ask the user for a public DNS server reachable through E. A private DNS server is rejected by the step 4 firewall. |
-| small requests work, TLS or large downloads hang | MTU: run `ip link set tunN mtu 1280` as root on both hosts. |
-| remote internet stops while working | Tunnel dropped and the watchdog restored the network: rerun steps 4 to 7. |
+| `pasta: blocked` | Unprivileged user namespaces are restricted (Ubuntu: `kernel.apparmor_restrict_unprivileged_userns=1`) and this pasta has no AppArmor profile. The distribution's `passt` package ships one: install it (as root, through the password dialog) instead of a self-built pasta. If it is still blocked, stop and tell the user. |
+| `pasta cannot reach the internet through E` | E has no internet: pick another E in step 2. |
+| `tunnel failed` | Read the log it prints. `Permission denied` or `Operation not permitted` from the remote bridge: `tunN` there is missing or owned by another user, check LOGIN (step 3). ssh errors: check that `ssh H true` works. Then run `rm -rf $XDG_RUNTIME_DIR/ssh-inet-tunnel-N` and retry step 4. |
+| IPs work, names do not | DNS is blocked on the egress path: on the remote host, as root, write `nameserver 1.1.1.1` to `/etc/resolv.conf`, then `9.9.9.9`, and rerun step 6 after each. If neither works, ask the user for a public DNS server reachable through E. A private DNS server is rejected by the step 4 firewall. |
+| remote internet stops while working | Tunnel dropped and the watchdog restored the network: run step 7, then steps 3 to 5 again. |

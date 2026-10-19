@@ -6,33 +6,37 @@ Copilot, OpenCode) to do something on a host over SSH, the host has no internet,
 explicitly ask to give it some, the agent follows `skills/ssh-internet-tunnel/SKILL.md`.
 
 ```
-remote host --- ssh -w (tunN) ---> your machine --- NAT ---> VPN or default interface ---> internet
+remote host                                  your machine, private network namespace (no root)
+tunN 10.254.N.2 <-> tunbridge.py == ssh H == tunbridge.py <-> tunN 10.254.N.1 -- NAT -- pasta -- VPN or default interface -- internet
 ```
 
-The skill is plain text: every command is in `SKILL.md`. The agent inspects both hosts on
-its own, asks you once to approve the plan, then sets everything up and shows the output.
-Where `sudo` asks for a password, the agent opens a password dialog on your desktop
-(`askpass.sh`: ssh-askpass, zenity or kdialog) and pipes what you type straight into sudo,
-so the password never reaches the agent. Without a desktop session it hands you the block
-to paste instead.
+The skill is plain text plus two small helpers: every command is in `SKILL.md`. The agent
+inspects both hosts on its own, asks you once to approve the plan, then sets everything up
+and shows the output. Where `sudo` on the remote host asks for a password, the agent opens
+a password dialog on your desktop (`askpass.sh`: ssh-askpass, zenity or kdialog) and pipes
+what you type straight into sudo, so the password never reaches the agent. Without a
+desktop session it hands you the block to paste instead.
 
 What it does:
 
+- Needs no root on your machine. `pasta` (from the `passt` package) gives a private
+  network namespace to your normal user; the tun device, NAT and firewall live in it and
+  disappear when the tunnel stops. pasta sends the traffic out through ordinary sockets.
+- Carries the tunnel over a plain `ssh H` session: `tunbridge.py` on each end moves
+  packets between the tun device and ssh's stdin/stdout. No `ssh -w`, no sshd change on
+  the remote host.
 - Detects the egress interface on your machine with `ip route get`, so VPNs that work via
   policy routing (WireGuard, sing-box or clash TUN, OpenVPN) are found whatever their
-  name. A VPN is preferred; you confirm or pick another interface.
-- Pre-creates user-owned tun devices, so `ssh -w` runs without root and without root SSH
-  login. Picks a free tunnel number and subnet (`10.254.N.0/30`).
-- On your machine: NAT out of that interface only, no access to your machine or private
-  ranges from the tunnel, `ip_forward` restored to its previous value afterwards.
+  name. A VPN is preferred; you confirm or pick another interface. pasta binds its sockets
+  to that interface, so traffic never leaks out of another one.
+- Rejects tunnel traffic to your machine's own addresses and to private ranges.
 - On the remote host: routes the internet through the tunnel with two `/1` routes (the
   default route stays untouched), keeps your SSH connection and private ranges on their
   current routes, switches DNS, and starts a watchdog that restores everything if the
-  tunnel drops.
-- Each side writes an undo script to `/run/ssh-inet-tunnel-N/restore.sh` at setup.
+  tunnel drops. The undo script is `/run/ssh-inet-tunnel-N/restore.sh`.
 
-Requirements: Linux on both ends, `iptables` on your machine, root on both hosts,
-key-based `ssh` to the remote host. IPv4 only.
+Requirements: Linux on both ends; `pasta` and `python3` on your machine; `python3` and
+root on the remote host; key-based `ssh` to it. IPv4 only.
 
 ## Install
 
@@ -59,5 +63,6 @@ python3 test/e2e.py
 
 Needs Docker. Starts two privileged Debian containers, `local` (internet) and `remote`
 (internal network only), runs the `SKILL.md` blocks as written with only the top values
-filled in, checks that `remote` reaches `https://example.com`, drops the tunnel, and checks
-that both sides are restored. Removes the containers and networks at the end.
+filled in, checks that `remote` reaches `https://example.com` but not `local` itself, that
+nothing changed on `local`, drops the tunnel, and checks that both sides are restored.
+Removes the containers and networks at the end.
