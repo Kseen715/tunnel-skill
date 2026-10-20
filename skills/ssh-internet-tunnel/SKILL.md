@@ -101,8 +101,9 @@ ip -4 route get 1.1.1.1
 echo "vpn-like:"; ip -o -d link show | grep -E 'POINTOPOINT|wireguard|tun type' | cut -d: -f2
 curl -sS -m 5 -o /dev/null -w 'internet: http %{http_code}\n' https://example.com
 command -v python3 >/dev/null && echo "python3: ok" || echo "python3: missing"
-if pasta --config-net -q -- true 2>/dev/null; then echo "pasta: ok"
-elif command -v pasta >/dev/null; then echo "pasta: blocked"; else echo "pasta: missing"; fi
+pasta --config-net -q -- true 2>/dev/null; RC=$?
+if [ $RC = 0 ]; then echo "pasta: ok"
+elif command -v pasta >/dev/null; then echo "pasta: blocked (exit $RC)"; else echo "pasta: missing"; fi
 ```
 
 Remote host:
@@ -178,7 +179,8 @@ E=wg0                  # egress interface
 PY=python3             # python on the remote host
 BRIDGE=/path/to/tunbridge.py
 D=${XDG_RUNTIME_DIR:-/tmp}/ssh-inet-tunnel-$N
-PASTA="pasta --config-net -q --no-map-gw --outbound-if4 $E"
+DEF=$(ip -4 route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
+PASTA="pasta --config-net -q --no-map-gw --outbound-if4 $E${DEF:+ -i $DEF}"
 BLOCK=0.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10
 SELF=$(ip -4 -o addr show | tr -s ' ' | cut -d' ' -f4 | cut -d/ -f1 | paste -sd, -)
 IP=$(getent ahostsv4 example.com | head -n 1 | cut -d' ' -f1)
@@ -213,6 +215,10 @@ done
 cat "$D/log"; echo "tunnel failed" >&2; exit 1
 EOF
 ```
+
+pasta copies addresses and routes into the namespace from the interface of the main
+default route (`-i`), since E may have no gateway of its own (sing-box or clash TUN with
+policy routing); traffic still leaves only through E.
 
 It must print `tunnel up`. pasta may also print `Couldn't get any nameserver address`;
 that is harmless.
@@ -258,7 +264,11 @@ fi
 ip route add 0.0.0.0/1 dev $T
 ip route add 128.0.0.0/1 dev $T
 
-# Public DNS while the tunnel is up.
+# Public DNS while the tunnel is up. Lift chattr +i for the switch, put it back on restore.
+LOCKED=
+if lsattr -d /etc/resolv.conf 2>/dev/null | cut -d' ' -f1 | grep -q i; then
+  chattr -i /etc/resolv.conf && LOCKED=1
+fi
 cp -P /etc/resolv.conf "$D/resolv.conf"
 if [ -L /etc/resolv.conf ]; then
   echo "rm -f /etc/resolv.conf; cp -P $D/resolv.conf /etc/resolv.conf" >> "$D/restore.sh"
@@ -266,6 +276,7 @@ if [ -L /etc/resolv.conf ]; then
 else
   echo "cat $D/resolv.conf > /etc/resolv.conf" >> "$D/restore.sh"
 fi
+[ -z "$LOCKED" ] || echo "chattr +i /etc/resolv.conf" >> "$D/restore.sh"
 { echo "nameserver $DNS" > /etc/resolv.conf; } 2>/dev/null || echo "warning: cannot write /etc/resolv.conf, DNS unchanged" >&2
 
 # Watchdog: restore everything once the tunnel loses carrier.
@@ -300,6 +311,8 @@ Ask the user once, then run all of it in this order, replacing 9 with N:
    D=${XDG_RUNTIME_DIR:-/tmp}/ssh-inet-tunnel-9
    pkill -g "$(cat "$D/pid")"; rm -rf "$D"
    ```
+   `pkill: killing pid ... failed: Permission denied` is expected: it is a process inside
+   pasta's namespace, which exits together with the rest of the tunnel.
 2. Remote host: the watchdog restores routes and DNS and deletes `tun9` within a few
    seconds. Check:
    ```sh
@@ -313,7 +326,7 @@ Ask the user once, then run all of it in this order, replacing 9 with N:
 
 | Symptom | Cause and fix |
 |---|---|
-| `pasta: blocked` | Unprivileged user namespaces are restricted (Ubuntu: `kernel.apparmor_restrict_unprivileged_userns=1`) and this pasta has no AppArmor profile. The distribution's `passt` package ships one: install it (as root, through the password dialog) instead of a self-built pasta. If it is still blocked, stop and tell the user. |
+| `pasta: blocked` | Unprivileged user namespaces are restricted (Ubuntu: `kernel.apparmor_restrict_unprivileged_userns=1`) and this pasta has no AppArmor profile. The distribution's `passt` package ships one: install it (as root, through the password dialog) instead of a self-built pasta. If it is `blocked (exit 139)` with the distribution's profile installed, the profile does not let pasta map its own binary (newer AppArmor): as root, back up `/etc/apparmor.d/usr.bin.pasta`, add the line `/usr/bin/pasta{,.avx2} mr,` inside its `profile pasta` block, run `apparmor_parser -r /etc/apparmor.d/usr.bin.pasta`, and tell the user a `passt` upgrade will overwrite the edit. If it is still blocked, stop and tell the user. |
 | `pasta cannot reach the internet through E` | E has no internet: pick another E in step 2. |
 | `tunnel failed` | Read the log it prints. `Permission denied` or `Operation not permitted` from the remote bridge: `tunN` there is missing or owned by another user, check LOGIN (step 3). ssh errors: check that `ssh H true` works. Then run `rm -rf $XDG_RUNTIME_DIR/ssh-inet-tunnel-N` and retry step 4. |
 | IPs work, names do not | DNS is blocked on the egress path: on the remote host, as root, write `nameserver 1.1.1.1` to `/etc/resolv.conf`, then `9.9.9.9`, and rerun step 6 after each. If neither works, ask the user for a public DNS server reachable through E. A private DNS server is rejected by the step 4 firewall. |
